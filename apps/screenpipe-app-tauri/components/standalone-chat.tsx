@@ -108,6 +108,11 @@ import {
   buildProviderErrorMessage,
   preflightChatProvider,
 } from "@/lib/chat/provider-errors";
+import {
+  finalizePiTerminatedBlocks,
+  finalizePiTerminatedContent,
+  PI_TURN_TERMINATED_MESSAGE,
+} from "@/lib/chat/pi-termination";
 import { buildSystemPrompt, buildConnectionsContext } from "@/lib/chat/system-prompt";
 import {
   classifyCurl,
@@ -6145,6 +6150,64 @@ export function StandaloneChat({
     // closure without re-binding.
     handleAgentEventDataRef.current = handlePiEventData;
 
+    function failActivePiTurnAfterTermination(): boolean {
+      const msgId = piMessageIdRef.current;
+      if (!msgId) return false;
+
+      cancelStreamingMessageRender();
+      const sid = piSessionIdRef.current;
+      const blocksSnapshot = finalizePiTerminatedBlocks(
+        piContentBlocksRef.current,
+      ) as ContentBlock[];
+      const content = finalizePiTerminatedContent(
+        piStreamingTextRef.current,
+        blocksSnapshot,
+      );
+
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId
+            ? {
+                ...m,
+                content: finalizePiTerminatedContent(m.content || content, blocksSnapshot),
+                contentBlocks: blocksSnapshot,
+                retryPrompt: lastUserMessageRef.current || m.retryPrompt,
+              }
+            : m,
+        ),
+      );
+
+      const store = useChatStore.getState();
+      store.actions.patchMessage(sid, msgId, (m: any) => ({
+        ...m,
+        content: finalizePiTerminatedContent(m?.content || content, blocksSnapshot),
+        contentBlocks: finalizePiTerminatedBlocks(m?.contentBlocks ?? blocksSnapshot),
+        retryPrompt: lastUserMessageRef.current || m?.retryPrompt,
+      }));
+      store.actions.setStreaming(sid, {
+        streamingMessageId: null,
+        streamingText: "",
+        contentBlocks: [],
+        isLoading: false,
+        isStreaming: false,
+      });
+      store.actions.patch(sid, {
+        status: "error",
+        lastError: PI_TURN_TERMINATED_MESSAGE,
+        updatedAt: Date.now(),
+      });
+
+      piStreamingTextRef.current = "";
+      piMessageIdRef.current = null;
+      piContentBlocksRef.current = [];
+      piLastErrorRef.current = PI_TURN_TERMINATED_MESSAGE;
+      piThinkingStartRef.current = null;
+      forceQueueModeRef.current = false;
+      setIsLoading(false);
+      setIsStreaming(false);
+      return true;
+    }
+
     const setup = async () => {
       // Ensure the bus's Tauri listener is up before any consumer
       // (router, panel, pipes hook) starts registering. Idempotent.
@@ -6165,6 +6228,7 @@ export function StandaloneChat({
           return;
         }
         piTerminationDedupRef.current[termKey] = nowMs;
+        failActivePiTurnAfterTermination();
         if (typeof terminatedPid === "number" && piIntentionallyStoppedPidsRef.current.delete(terminatedPid)) {
           return;
         }
@@ -6180,25 +6244,6 @@ export function StandaloneChat({
             return;
           }
         } catch {}
-
-        // If a message was in flight, append error to the message so the user
-        // knows the agent stopped unexpectedly (not just "completed").
-        if (piMessageIdRef.current) {
-          const msgId = piMessageIdRef.current;
-          setMessages((prev) =>
-            prev.map((m) => {
-              if (m.id !== msgId) return m;
-              const existing = m.content && m.content !== "Processing..." ? m.content : "";
-              const errorSuffix = "\n\n---\n\n⚠️ agent stopped unexpectedly — restarting automatically...";
-              return { ...m, content: existing + errorSuffix };
-            })
-          );
-          piStreamingTextRef.current = "";
-          piMessageIdRef.current = null;
-          piContentBlocksRef.current = [];
-          setIsLoading(false);
-          setIsStreaming(false);
-        }
 
         // Auto-restart with exponential backoff to avoid crash loops
         const now = Date.now();
